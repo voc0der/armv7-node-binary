@@ -100,6 +100,7 @@ jobs:
           # Build the host tools (node_mksnapshot, etc.) natively first
           # then cross-compile the actual target
           CC_host=gcc CXX_host=g++ \
+          AR_host=ar RANLIB_host=ranlib \
           CC=${{ env.CROSS_TRIPLE }}-gcc \
           CXX=${{ env.CROSS_TRIPLE }}-g++ \
           AR=${{ env.CROSS_TRIPLE }}-ar \
@@ -111,7 +112,6 @@ jobs:
             --with-arm-float-abi=hard \
             --with-arm-fpu=vfpv3 \
             --prefix=/usr/local \
-            --fully-static \
             --without-intl \
             --openssl-no-asm \
             2>&1 | tee ../configure.log
