@@ -74,14 +74,7 @@ jobs:
 
       - name: Install cross-compilation toolchain
         run: |
-          # Detect system GCC major version
-          GCC_VER=$(gcc -dumpversion | cut -d. -f1)
-          echo "System GCC version: ${GCC_VER}"
-
-          sudo dpkg --add-architecture i386
           sudo apt-get update -qq
-
-          # Install ARM cross-compiler
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf \
             g++-arm-linux-gnueabihf \
@@ -93,21 +86,6 @@ jobs:
             curl \
             xz-utils
 
-          # Install 32-bit dev libraries for V8 host tools (-m32 compilation).
-          # V8 requires ia32 host when targeting ARM.
-          sudo apt-get install -y --no-install-recommends \
-            libc6-dev-i386 \
-            "lib32stdc++-${GCC_VER}-dev"
-
-          # Provide 32-bit asm headers. The linux-libc-dev package only ships
-          # headers for the native arch; create symlink so -m32 finds them.
-          # These headers (errno, ioctl, types, etc.) are identical across
-          # x86_64 and i386 on Linux.
-          sudo mkdir -p /usr/include/i386-linux-gnu
-          sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/i386-linux-gnu/asm
-
-          echo "Toolchain ready."
-
       - name: Download Node.js source
         run: |
           VERSION="${{ needs.check-version.outputs.node_version }}"
@@ -116,12 +94,24 @@ jobs:
           echo "NODE_SRC=node-v${VERSION}" >> $GITHUB_ENV
           echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
+      - name: Patch V8 host arch restriction
+        working-directory: ${{ env.NODE_SRC }}
+        run: |
+          # V8's v8config.h has a compile-time check that blocks x86_64 hosts
+          # from building ARM target code. This is needed for mksnapshot (which
+          # generates ARM machine code on the host), but we use --without-snapshot
+          # so no ARM code generation happens on the host. Safe to remove.
+          sed -i '/#error Target architecture arm is only supported on arm and ia32 host/d' \
+            deps/v8/include/v8config.h
+          echo "Patched v8config.h — removed host arch restriction"
+
       - name: Configure Node.js for ARMv7 cross-compilation
         working-directory: ${{ env.NODE_SRC }}
         run: |
-          # V8 requires host tools to be 32-bit (ia32) when targeting ARM.
-          # --without-snapshot avoids building mksnapshot host tool.
-          CC_host="gcc -m32" CXX_host="g++ -m32" \
+          # Native 64-bit host compilers + ARM cross-compiler for target.
+          # --without-snapshot: skip mksnapshot (only tool that actually needs
+          #   to generate ARM code on the host). Costs ~100ms startup time.
+          CC_host=gcc CXX_host=g++ \
           AR_host=ar RANLIB_host=ranlib \
           CC=${{ env.CROSS_TRIPLE }}-gcc \
           CXX=${{ env.CROSS_TRIPLE }}-g++ \
