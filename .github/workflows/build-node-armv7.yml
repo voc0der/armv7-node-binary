@@ -79,12 +79,19 @@ jobs:
             gcc-arm-linux-gnueabihf \
             g++-arm-linux-gnueabihf \
             binutils-arm-linux-gnueabihf \
+            qemu-user-static \
+            binfmt-support \
             python3 \
             python3-pip \
             ninja-build \
             pkg-config \
             curl \
             xz-utils
+
+          # Verify QEMU can run ARM binaries
+          echo "Testing QEMU ARM execution..."
+          echo 'int main(){return 0;}' | ${{ env.CROSS_TRIPLE }}-gcc -x c - -o /tmp/test-arm -static
+          /tmp/test-arm && echo "QEMU ARM execution works!" || { echo "QEMU ARM execution failed"; exit 1; }
 
       - name: Download Node.js source
         run: |
@@ -94,36 +101,19 @@ jobs:
           echo "NODE_SRC=node-v${VERSION}" >> $GITHUB_ENV
           echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
-      - name: Patch V8 for x86_64 host cross-compilation
-        working-directory: ${{ env.NODE_SRC }}
-        run: |
-          # V8 blocks x86_64 hosts from cross-compiling for ARM because
-          # mksnapshot needs to generate ARM machine code (requires ia32 host).
-          # Since we use --without-snapshot, mksnapshot isn't built and the
-          # host tools (torque, bytecode generator, js2c) only generate
-          # platform-independent C++ code and data tables.
-          #
-          # Patch 1: Remove the #error that blocks x86_64 host for ARM target
-          sed -i '/#error Target architecture arm is only supported on arm and ia32 host/d' \
-            deps/v8/include/v8config.h
-
-          # Patch 2: Remove static_assert that checks tagged pointer size
-          # matches between host and target. On x86_64 host kTaggedSize=8
-          # but ARM target expects 4. The host tools don't use tagged pointers
-          # at runtime — they just generate code.
-          sed -i '/static_assert((kTaggedSize == 8) == TAGGED_SIZE_8_BYTES)/d' \
-            deps/v8/src/common/globals.h
-
-          echo "V8 patched for x86_64 host cross-compilation"
-
       - name: Configure Node.js for ARMv7 cross-compilation
         working-directory: ${{ env.NODE_SRC }}
         run: |
-          # Native 64-bit host compilers + ARM cross-compiler for target.
-          # --without-snapshot skips mksnapshot (the only tool that actually
-          # generates ARM machine code on the host).
-          CC_host=gcc CXX_host=g++ \
-          AR_host=ar RANLIB_host=ranlib \
+          # Use the ARM cross-compiler for BOTH host and target tools.
+          # The cross-compiler itself runs natively on x86_64 (fast).
+          # Any ARM binaries that need to execute during the build (torque,
+          # bytecode generator) run transparently via QEMU user-mode.
+          # This avoids all V8 pointer-size mismatches since both host
+          # and target are ARM.
+          CC_host=${{ env.CROSS_TRIPLE }}-gcc \
+          CXX_host=${{ env.CROSS_TRIPLE }}-g++ \
+          AR_host=${{ env.CROSS_TRIPLE }}-ar \
+          RANLIB_host=${{ env.CROSS_TRIPLE }}-ranlib \
           CC=${{ env.CROSS_TRIPLE }}-gcc \
           CXX=${{ env.CROSS_TRIPLE }}-g++ \
           AR=${{ env.CROSS_TRIPLE }}-ar \
@@ -149,8 +139,6 @@ jobs:
       - name: Stage and package
         working-directory: ${{ env.NODE_SRC }}
         run: |
-          # Manually stage instead of 'make install' (which re-triggers
-          # V8 host builds).
           TARNAME="node-v${{ env.VERSION }}-linux-armv7l"
           STAGE="${{ github.workspace }}/dist/${TARNAME}"
 
@@ -219,7 +207,6 @@ jobs:
           - Cross-compiler: \`${{ env.CROSS_TRIPLE }}-gcc\`
           - Float ABI: hard
           - FPU: vfpv3
-          - Static binary (no external libc dependency beyond glibc)
           - ICU / intl: disabled (reduces binary size; add \`--with-intl=small-icu\` in configure if needed)
 
           **SHA256:**
