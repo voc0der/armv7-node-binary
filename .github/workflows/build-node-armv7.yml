@@ -23,7 +23,6 @@ concurrency:
 env:
   NODE_MAJOR: 24
   ARCH: armv7l
-  CROSS_TRIPLE: arm-linux-gnueabihf
 
 jobs:
   check-version:
@@ -62,7 +61,7 @@ jobs:
           fi
 
   build:
-    name: Cross-Compile Node.js ${{ needs.check-version.outputs.node_version }} for ARMv7
+    name: Build Node.js ${{ needs.check-version.outputs.node_version }} for ARMv7
     needs: check-version
     runs-on: ubuntu-24.04
     if: needs.check-version.outputs.already_exists == 'false' || github.event.inputs.force_rebuild == 'true'
@@ -72,110 +71,103 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install cross-compilation toolchain
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            gcc-arm-linux-gnueabihf \
-            g++-arm-linux-gnueabihf \
-            binutils-arm-linux-gnueabihf \
-            qemu-user-static \
-            binfmt-support \
-            python3 \
-            python3-pip \
-            ninja-build \
-            pkg-config \
-            curl \
-            xz-utils
+      - name: Set up QEMU for ARM
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
 
-          # Verify QEMU can run ARM binaries
-          echo "Testing QEMU ARM execution..."
-          echo 'int main(){return 0;}' | ${{ env.CROSS_TRIPLE }}-gcc -x c - -o /tmp/test-arm -static
-          /tmp/test-arm && echo "QEMU ARM execution works!" || { echo "QEMU ARM execution failed"; exit 1; }
-
-      - name: Download Node.js source
+      - name: Build Node.js natively in ARM container
         run: |
           VERSION="${{ needs.check-version.outputs.node_version }}"
-          curl -fsSL "https://nodejs.org/dist/v${VERSION}/node-v${VERSION}.tar.xz" -o node.tar.xz
-          tar -xf node.tar.xz
-          echo "NODE_SRC=node-v${VERSION}" >> $GITHUB_ENV
+          TARNAME="node-v${VERSION}-linux-armv7l"
+
+          # Run the entire build inside a native ARM container.
+          # QEMU user-mode emulation makes this transparent — the
+          # container thinks it's running on real ARM hardware.
+          # This avoids ALL cross-compilation issues (V8 pointer-size
+          # mismatches, host/target arch confusion, etc.).
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e VERSION="${VERSION}" \
+            -e TARNAME="${TARNAME}" \
+            debian:bookworm \
+            bash -c '
+              set -euo pipefail
+
+              echo ">>> Running on: $(uname -m)"
+              echo ">>> Building Node.js v${VERSION} for ARM"
+
+              # Install build dependencies
+              apt-get update -qq
+              apt-get install -y --no-install-recommends \
+                build-essential \
+                python3 \
+                python3-pip \
+                curl \
+                xz-utils \
+                pkg-config \
+                ca-certificates
+
+              # Download and extract Node.js source
+              curl -fsSL "https://nodejs.org/dist/v${VERSION}/node-v${VERSION}.tar.xz" -o node.tar.xz
+              tar -xf node.tar.xz
+              cd "node-v${VERSION}"
+
+              # Configure — no cross-compilation needed, this IS ARM
+              ./configure \
+                --dest-cpu=arm \
+                --with-arm-float-abi=hard \
+                --with-arm-fpu=vfpv3 \
+                --prefix=/usr/local \
+                --without-intl \
+                --without-snapshot \
+                --openssl-no-asm \
+                2>&1 | tee /workspace/configure.log
+
+              # Build
+              make -j$(nproc) 2>&1 | tee /workspace/build.log
+
+              # Stage the output
+              STAGE="/workspace/dist/${TARNAME}"
+              mkdir -p "${STAGE}/bin" "${STAGE}/lib/node_modules" "${STAGE}/include"
+
+              cp out/Release/node "${STAGE}/bin/node"
+
+              # npm
+              cp -r deps/npm "${STAGE}/lib/node_modules/npm"
+              ln -s ../lib/node_modules/npm/bin/npm-cli.js "${STAGE}/bin/npm"
+              ln -s ../lib/node_modules/npm/bin/npx-cli.js "${STAGE}/bin/npx"
+
+              # corepack
+              if [ -d deps/corepack ]; then
+                cp -r deps/corepack "${STAGE}/lib/node_modules/corepack"
+                ln -s ../lib/node_modules/corepack/dist/corepack.js "${STAGE}/bin/corepack"
+              fi
+
+              # Headers
+              cp -r src/*.h "${STAGE}/include/" 2>/dev/null || true
+
+              # LICENSE
+              cp LICENSE "${STAGE}/" 2>/dev/null || true
+
+              echo ">>> Staged contents:"
+              ls -lR "${STAGE}/bin/"
+              file "${STAGE}/bin/node"
+            '
+
           echo "VERSION=${VERSION}" >> $GITHUB_ENV
-
-      - name: Configure Node.js for ARMv7 cross-compilation
-        working-directory: ${{ env.NODE_SRC }}
-        run: |
-          # Use the ARM cross-compiler for BOTH host and target tools.
-          # The cross-compiler itself runs natively on x86_64 (fast).
-          # Any ARM binaries that need to execute during the build (torque,
-          # bytecode generator) run transparently via QEMU user-mode.
-          # This avoids all V8 pointer-size mismatches since both host
-          # and target are ARM.
-          CC_host=${{ env.CROSS_TRIPLE }}-gcc \
-          CXX_host=${{ env.CROSS_TRIPLE }}-g++ \
-          AR_host=${{ env.CROSS_TRIPLE }}-ar \
-          RANLIB_host=${{ env.CROSS_TRIPLE }}-ranlib \
-          CC=${{ env.CROSS_TRIPLE }}-gcc \
-          CXX=${{ env.CROSS_TRIPLE }}-g++ \
-          AR=${{ env.CROSS_TRIPLE }}-ar \
-          RANLIB=${{ env.CROSS_TRIPLE }}-ranlib \
-          ./configure \
-            --cross-compiling \
-            --dest-cpu=arm \
-            --dest-os=linux \
-            --with-arm-float-abi=hard \
-            --with-arm-fpu=vfpv3 \
-            --prefix=/usr/local \
-            --without-intl \
-            --without-snapshot \
-            --openssl-no-asm \
-            2>&1 | tee ../configure.log
-
-      - name: Build Node.js
-        working-directory: ${{ env.NODE_SRC }}
-        run: |
-          set -o pipefail
-          make -j$(nproc) 2>&1 | tee ../build.log
-
-      - name: Stage and package
-        working-directory: ${{ env.NODE_SRC }}
-        run: |
-          TARNAME="node-v${{ env.VERSION }}-linux-armv7l"
-          STAGE="${{ github.workspace }}/dist/${TARNAME}"
-
-          mkdir -p "${STAGE}/bin" "${STAGE}/lib/node_modules" "${STAGE}/include"
-
-          # Node binary
-          cp out/Release/node "${STAGE}/bin/node"
-
-          # npm (bundled in deps/npm)
-          cp -r deps/npm "${STAGE}/lib/node_modules/npm"
-          ln -s ../lib/node_modules/npm/bin/npm-cli.js "${STAGE}/bin/npm"
-          ln -s ../lib/node_modules/npm/bin/npx-cli.js "${STAGE}/bin/npx"
-
-          # corepack (bundled in deps/corepack)
-          if [ -d deps/corepack ]; then
-            cp -r deps/corepack "${STAGE}/lib/node_modules/corepack"
-            ln -s ../lib/node_modules/corepack/dist/corepack.js "${STAGE}/bin/corepack"
-          fi
-
-          # Headers (for native addons)
-          cp -r src/*.h "${STAGE}/include/" 2>/dev/null || true
-
-          # LICENSE
-          cp LICENSE "${STAGE}/" 2>/dev/null || true
-
-          echo "Staged contents:"
-          ls -lR "${STAGE}/bin/"
-          file "${STAGE}/bin/node"
-
-          # Create tarball
-          mkdir -p "${{ github.workspace }}/release"
-          cd "${{ github.workspace }}/dist"
-          tar -czf "${{ github.workspace }}/release/${TARNAME}.tar.gz" "${TARNAME}"
-          cd "${{ github.workspace }}"
-          sha256sum release/${TARNAME}.tar.gz > release/SHASUMS256.txt
-
           echo "TARNAME=${TARNAME}" >> $GITHUB_ENV
+
+      - name: Package tarball
+        run: |
+          mkdir -p release
+          cd dist
+          tar -czf "${{ github.workspace }}/release/${{ env.TARNAME }}.tar.gz" "${{ env.TARNAME }}"
+          cd "${{ github.workspace }}"
+          sha256sum release/${{ env.TARNAME }}.tar.gz > release/SHASUMS256.txt
+
           echo "Tarball created:"
           ls -lh release/
 
@@ -204,7 +196,7 @@ jobs:
           Unofficial ARMv7l (32-bit ARM hard-float) build of Node.js v${VERSION}.
 
           **Built with:**
-          - Cross-compiler: \`${{ env.CROSS_TRIPLE }}-gcc\`
+          - Native ARM build via QEMU + Docker (debian:bookworm armhf)
           - Float ABI: hard
           - FPU: vfpv3
           - ICU / intl: disabled (reduces binary size; add \`--with-intl=small-icu\` in configure if needed)
