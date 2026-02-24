@@ -74,11 +74,14 @@ jobs:
 
       - name: Install cross-compilation toolchain
         run: |
+          sudo dpkg --add-architecture i386
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf \
             g++-arm-linux-gnueabihf \
             binutils-arm-linux-gnueabihf \
+            libc6-dev-i386 \
+            lib32stdc++-12-dev \
             python3 \
             python3-pip \
             ninja-build \
@@ -97,9 +100,9 @@ jobs:
       - name: Configure Node.js for ARMv7 cross-compilation
         working-directory: ${{ env.NODE_SRC }}
         run: |
-          # Build the host tools (node_mksnapshot, etc.) natively first
-          # then cross-compile the actual target
-          CC_host=gcc CXX_host=g++ \
+          # V8 requires host tools to be 32-bit (ia32) when targeting ARM.
+          # Using -m32 satisfies V8's compile-time arch check in v8config.h.
+          CC_host="gcc -m32" CXX_host="g++ -m32" \
           AR_host=ar RANLIB_host=ranlib \
           CC=${{ env.CROSS_TRIPLE }}-gcc \
           CXX=${{ env.CROSS_TRIPLE }}-g++ \
