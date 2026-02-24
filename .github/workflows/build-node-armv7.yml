@@ -74,16 +74,11 @@ jobs:
 
       - name: Install cross-compilation toolchain
         run: |
-          # Detect system GCC major version for matching 32-bit libstdc++ package
-          GCC_VER=$(gcc -dumpversion | cut -d. -f1)
-          sudo dpkg --add-architecture i386
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf \
             g++-arm-linux-gnueabihf \
             binutils-arm-linux-gnueabihf \
-            libc6-dev-i386 \
-            "lib32stdc++-${GCC_VER}-dev" \
             python3 \
             python3-pip \
             ninja-build \
@@ -102,9 +97,10 @@ jobs:
       - name: Configure Node.js for ARMv7 cross-compilation
         working-directory: ${{ env.NODE_SRC }}
         run: |
-          # V8 requires host tools to be 32-bit (ia32) when targeting ARM.
-          # Using -m32 satisfies V8's compile-time arch check in v8config.h.
-          CC_host="gcc -m32" CXX_host="g++ -m32" \
+          # Use --without-snapshot to avoid building V8 host tools.
+          # V8 requires ia32 host for ARM targets; skipping snapshots is
+          # simpler and only costs ~100ms startup time.
+          CC_host=gcc CXX_host=g++ \
           AR_host=ar RANLIB_host=ranlib \
           CC=${{ env.CROSS_TRIPLE }}-gcc \
           CXX=${{ env.CROSS_TRIPLE }}-g++ \
@@ -118,6 +114,7 @@ jobs:
             --with-arm-fpu=vfpv3 \
             --prefix=/usr/local \
             --without-intl \
+            --without-snapshot \
             --openssl-no-asm \
             2>&1 | tee ../configure.log
 
