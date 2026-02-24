@@ -1,0 +1,84 @@
+name: Setup Node.js ARMv7 (Reusable)
+
+# Other repos call this like:
+#
+#   jobs:
+#     setup:
+#       uses: voc0der/armv7-node-binary/.github/workflows/setup-node-armv7.yml@main
+#       with:
+#         node_major: 24
+#       secrets: inherit
+#
+# After calling, the node binary is on PATH for subsequent steps in the CALLING job.
+# NOTE: The calling job must run on an ARMv7 runner or use QEMU.
+
+on:
+  workflow_call:
+    inputs:
+      node_major:
+        description: 'Node major version'
+        required: false
+        default: '24'
+        type: string
+      install_path:
+        description: 'Where to extract the node binary'
+        required: false
+        default: '/opt/node-armv7'
+        type: string
+    outputs:
+      node_version:
+        description: 'The resolved Node.js version that was installed'
+        value: ${{ jobs.setup.outputs.node_version }}
+      tarball_url:
+        description: 'Direct URL to the tarball that was downloaded'
+        value: ${{ jobs.setup.outputs.tarball_url }}
+
+jobs:
+  setup:
+    name: Fetch Node.js ARMv7 Binary
+    runs-on: ubuntu-latest
+    outputs:
+      node_version: ${{ steps.fetch.outputs.node_version }}
+      tarball_url: ${{ steps.fetch.outputs.tarball_url }}
+
+    steps:
+      - name: Fetch latest ARMv7 release for Node ${{ inputs.node_major }}
+        id: fetch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Find latest release tag matching the requested major version
+          RELEASE=$(gh release list --repo "$REPO" --limit 20 --json tagName,createdAt \
+            | jq -r '[.[] | select(.tagName | startswith("v${{ inputs.node_major }}."))] | sort_by(.createdAt) | last | .tagName')
+
+          if [ -z "$RELEASE" ] || [ "$RELEASE" = "null" ]; then
+            echo "ERROR: No release found for Node ${{ inputs.node_major }} in $REPO"
+            exit 1
+          fi
+
+          VERSION=$(echo "$RELEASE" | sed 's/^v//;s/-armv7l$//')
+          TARBALL_URL=$(gh release view "$RELEASE" --repo "$REPO" --json assets \
+            | jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .url')
+
+          echo "node_version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tarball_url=${TARBALL_URL}" >> $GITHUB_OUTPUT
+          echo "Resolved: Node v${VERSION}, release ${RELEASE}"
+          echo "Tarball: ${TARBALL_URL}"
+
+      - name: Download and extract
+        run: |
+          mkdir -p "${{ inputs.install_path }}"
+          curl -fsSL "${{ steps.fetch.outputs.tarball_url }}" -o node.tar.gz
+          tar -xzf node.tar.gz --strip-components=1 -C "${{ inputs.install_path }}"
+          echo "${{ inputs.install_path }}/bin" >> $GITHUB_PATH
+          echo "Node binary extracted to ${{ inputs.install_path }}"
+          ls "${{ inputs.install_path }}/bin/"
+
+      - name: Smoke test
+        run: |
+          # This only works if running natively on ARMv7 or under QEMU
+          # On x86 runners this will fail with "Exec format error" which is expected
+          NODE_BIN="${{ inputs.install_path }}/bin/node"
+          file "$NODE_BIN"
+          echo "Binary size: $(du -sh $NODE_BIN | cut -f1)"

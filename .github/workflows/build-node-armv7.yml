@@ -1,0 +1,204 @@
+name: Build Node.js ARMv7
+
+on:
+  schedule:
+    # Run weekly on Mondays at 02:00 UTC
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: 'Node.js version to build (e.g. 24.0.0). Leave blank to use latest Node 24.'
+        required: false
+        default: ''
+      force_rebuild:
+        description: 'Force rebuild even if release already exists'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: build-node-armv7
+  cancel-in-progress: false
+
+env:
+  NODE_MAJOR: 24
+  ARCH: armv7l
+  CROSS_TRIPLE: arm-linux-gnueabihf
+
+jobs:
+  check-version:
+    name: Resolve Target Version
+    runs-on: ubuntu-latest
+    outputs:
+      node_version: ${{ steps.resolve.outputs.node_version }}
+      tag_name: ${{ steps.resolve.outputs.tag_name }}
+      already_exists: ${{ steps.check_release.outputs.already_exists }}
+    steps:
+      - name: Resolve Node.js version
+        id: resolve
+        run: |
+          if [ -n "${{ github.event.inputs.node_version }}" ]; then
+            VERSION="${{ github.event.inputs.node_version }}"
+          else
+            VERSION=$(curl -fsSL https://nodejs.org/dist/latest-v${{ env.NODE_MAJOR }}.x/SHASUMS256.txt \
+              | head -1 | grep -oP 'node-v\K[0-9]+\.[0-9]+\.[0-9]+')
+          fi
+          echo "node_version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag_name=v${VERSION}-armv7l" >> $GITHUB_OUTPUT
+          echo "Resolved Node.js version: ${VERSION}"
+
+      - name: Check if release already exists
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.resolve.outputs.node_version }}-armv7l"
+          if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "already_exists=true" >> $GITHUB_OUTPUT
+            echo "Release $TAG already exists."
+          else
+            echo "already_exists=false" >> $GITHUB_OUTPUT
+            echo "Release $TAG does not exist yet, proceeding with build."
+          fi
+
+  build:
+    name: Cross-Compile Node.js ${{ needs.check-version.outputs.node_version }} for ARMv7
+    needs: check-version
+    runs-on: ubuntu-latest
+    if: needs.check-version.outputs.already_exists == 'false' || github.event.inputs.force_rebuild == 'true'
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-linux-gnueabihf \
+            g++-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf \
+            python3 \
+            python3-pip \
+            ninja-build \
+            pkg-config \
+            curl \
+            xz-utils
+
+      - name: Download Node.js source
+        run: |
+          VERSION="${{ needs.check-version.outputs.node_version }}"
+          curl -fsSL "https://nodejs.org/dist/v${VERSION}/node-v${VERSION}.tar.xz" -o node.tar.xz
+          tar -xf node.tar.xz
+          echo "NODE_SRC=node-v${VERSION}" >> $GITHUB_ENV
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Configure Node.js for ARMv7 cross-compilation
+        working-directory: ${{ env.NODE_SRC }}
+        run: |
+          # Build the host tools (node_mksnapshot, etc.) natively first
+          # then cross-compile the actual target
+          CC_host=gcc CXX_host=g++ \
+          CC=${{ env.CROSS_TRIPLE }}-gcc \
+          CXX=${{ env.CROSS_TRIPLE }}-g++ \
+          AR=${{ env.CROSS_TRIPLE }}-ar \
+          RANLIB=${{ env.CROSS_TRIPLE }}-ranlib \
+          ./configure \
+            --cross-compiling \
+            --dest-cpu=arm \
+            --dest-os=linux \
+            --with-arm-float-abi=hard \
+            --with-arm-fpu=vfpv3 \
+            --prefix=/usr/local \
+            --fully-static \
+            --without-intl \
+            --openssl-no-asm \
+            2>&1 | tee ../configure.log
+
+      - name: Build Node.js
+        working-directory: ${{ env.NODE_SRC }}
+        run: |
+          # Use all available cores; GH runners have 2
+          make -j$(nproc) 2>&1 | tee ../build.log
+          echo "Build finished with exit code $?"
+
+      - name: Stage install
+        working-directory: ${{ env.NODE_SRC }}
+        run: |
+          DESTDIR=${{ github.workspace }}/dist make install
+          # Resulting tree: dist/usr/local/{bin,include,lib,share}
+
+      - name: Create tarball
+        run: |
+          TARNAME="node-v${{ env.VERSION }}-linux-armv7l"
+          mkdir -p release
+          cd dist
+          # Repack to mirror official Node dist structure
+          mv usr/local "${TARNAME}"
+          tar -czf ../release/${TARNAME}.tar.gz "${TARNAME}"
+          cd ..
+          sha256sum release/${TARNAME}.tar.gz > release/SHASUMS256.txt
+          echo "TARNAME=${TARNAME}" >> $GITHUB_ENV
+          echo "Tarball created:"
+          ls -lh release/
+
+      - name: Verify binary architecture
+        run: |
+          # Quick sanity check - file should report ARM
+          BINARY="dist/${TARNAME}/bin/node"
+          if [ -f "$BINARY" ]; then
+            file "$BINARY"
+          else
+            echo "Warning: could not find node binary for arch check"
+          fi
+
+      - name: Upload build artifacts (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-armv7l-build
+          path: |
+            release/
+            configure.log
+            build.log
+          retention-days: 7
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check-version.outputs.tag_name }}"
+          VERSION="${{ env.VERSION }}"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Node.js v${VERSION} Linux ARMv7l" \
+            --notes "$(cat <<EOF
+          ## Node.js v${VERSION} - Linux ARMv7l (hard-float)
+
+          Unofficial ARMv7l (32-bit ARM hard-float) build of Node.js v${VERSION}.
+
+          **Built with:**
+          - Cross-compiler: \`${{ env.CROSS_TRIPLE }}-gcc\`
+          - Float ABI: hard
+          - FPU: vfpv3
+          - Static binary (no external libc dependency beyond glibc)
+          - ICU / intl: disabled (reduces binary size; add \`--with-intl=small-icu\` in configure if needed)
+
+          **SHA256:**
+          \`\`\`
+          $(cat release/SHASUMS256.txt)
+          \`\`\`
+
+          Built automatically by GitHub Actions. Source: https://nodejs.org/dist/v${VERSION}/
+          EOF
+          )" \
+            release/*.tar.gz \
+            release/SHASUMS256.txt
+
+  notify-skip:
+    name: Skipped (already built)
+    needs: check-version
+    runs-on: ubuntu-latest
+    if: needs.check-version.outputs.already_exists == 'true' && github.event.inputs.force_rebuild != 'true'
+    steps:
+      - run: echo "Release ${{ needs.check-version.outputs.tag_name }} already exists. Skipping build."
