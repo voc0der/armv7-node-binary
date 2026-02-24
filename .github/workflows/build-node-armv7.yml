@@ -74,7 +74,14 @@ jobs:
 
       - name: Install cross-compilation toolchain
         run: |
+          # Detect system GCC major version
+          GCC_VER=$(gcc -dumpversion | cut -d. -f1)
+          echo "System GCC version: ${GCC_VER}"
+
+          sudo dpkg --add-architecture i386
           sudo apt-get update -qq
+
+          # Install ARM cross-compiler
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf \
             g++-arm-linux-gnueabihf \
@@ -85,6 +92,21 @@ jobs:
             pkg-config \
             curl \
             xz-utils
+
+          # Install 32-bit dev libraries for V8 host tools (-m32 compilation).
+          # V8 requires ia32 host when targeting ARM.
+          sudo apt-get install -y --no-install-recommends \
+            libc6-dev-i386 \
+            "lib32stdc++-${GCC_VER}-dev"
+
+          # Provide 32-bit asm headers. The linux-libc-dev package only ships
+          # headers for the native arch; create symlink so -m32 finds them.
+          # These headers (errno, ioctl, types, etc.) are identical across
+          # x86_64 and i386 on Linux.
+          sudo mkdir -p /usr/include/i386-linux-gnu
+          sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/i386-linux-gnu/asm
+
+          echo "Toolchain ready."
 
       - name: Download Node.js source
         run: |
@@ -97,10 +119,9 @@ jobs:
       - name: Configure Node.js for ARMv7 cross-compilation
         working-directory: ${{ env.NODE_SRC }}
         run: |
-          # Use --without-snapshot to avoid building V8 host tools.
-          # V8 requires ia32 host for ARM targets; skipping snapshots is
-          # simpler and only costs ~100ms startup time.
-          CC_host=gcc CXX_host=g++ \
+          # V8 requires host tools to be 32-bit (ia32) when targeting ARM.
+          # --without-snapshot avoids building mksnapshot host tool.
+          CC_host="gcc -m32" CXX_host="g++ -m32" \
           AR_host=ar RANLIB_host=ranlib \
           CC=${{ env.CROSS_TRIPLE }}-gcc \
           CXX=${{ env.CROSS_TRIPLE }}-g++ \
@@ -121,9 +142,8 @@ jobs:
       - name: Build Node.js
         working-directory: ${{ env.NODE_SRC }}
         run: |
-          # Use all available cores; GH runners have 2
+          set -o pipefail
           make -j$(nproc) 2>&1 | tee ../build.log
-          echo "Build finished with exit code $?"
 
       - name: Stage and package
         working-directory: ${{ env.NODE_SRC }}
