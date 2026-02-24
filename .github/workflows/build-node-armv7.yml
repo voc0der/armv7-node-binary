@@ -125,35 +125,50 @@ jobs:
           make -j$(nproc) 2>&1 | tee ../build.log
           echo "Build finished with exit code $?"
 
-      - name: Stage install
+      - name: Stage and package
         working-directory: ${{ env.NODE_SRC }}
         run: |
-          DESTDIR=${{ github.workspace }}/dist make install
-          # Resulting tree: dist/usr/local/{bin,include,lib,share}
-
-      - name: Create tarball
-        run: |
+          # Skip 'make install' — it re-triggers V8 host builds that fail
+          # on x86_64 when targeting ARM. Manually stage the output instead.
           TARNAME="node-v${{ env.VERSION }}-linux-armv7l"
-          mkdir -p release
-          cd dist
-          # Repack to mirror official Node dist structure
-          mv usr/local "${TARNAME}"
-          tar -czf ../release/${TARNAME}.tar.gz "${TARNAME}"
-          cd ..
+          STAGE="${{ github.workspace }}/dist/${TARNAME}"
+
+          mkdir -p "${STAGE}/bin" "${STAGE}/lib/node_modules" "${STAGE}/include"
+
+          # Node binary
+          cp out/Release/node "${STAGE}/bin/node"
+
+          # npm (bundled in deps/npm)
+          cp -r deps/npm "${STAGE}/lib/node_modules/npm"
+          ln -s ../lib/node_modules/npm/bin/npm-cli.js "${STAGE}/bin/npm"
+          ln -s ../lib/node_modules/npm/bin/npx-cli.js "${STAGE}/bin/npx"
+
+          # corepack (bundled in deps/corepack)
+          if [ -d deps/corepack ]; then
+            cp -r deps/corepack "${STAGE}/lib/node_modules/corepack"
+            ln -s ../lib/node_modules/corepack/dist/corepack.js "${STAGE}/bin/corepack"
+          fi
+
+          # Headers (for native addons)
+          cp -r src/*.h "${STAGE}/include/" 2>/dev/null || true
+
+          # LICENSE
+          cp LICENSE "${STAGE}/" 2>/dev/null || true
+
+          echo "Staged contents:"
+          ls -lR "${STAGE}/bin/"
+          file "${STAGE}/bin/node"
+
+          # Create tarball
+          mkdir -p "${{ github.workspace }}/release"
+          cd "${{ github.workspace }}/dist"
+          tar -czf "${{ github.workspace }}/release/${TARNAME}.tar.gz" "${TARNAME}"
+          cd "${{ github.workspace }}"
           sha256sum release/${TARNAME}.tar.gz > release/SHASUMS256.txt
+
           echo "TARNAME=${TARNAME}" >> $GITHUB_ENV
           echo "Tarball created:"
           ls -lh release/
-
-      - name: Verify binary architecture
-        run: |
-          # Quick sanity check - file should report ARM
-          BINARY="dist/${TARNAME}/bin/node"
-          if [ -f "$BINARY" ]; then
-            file "$BINARY"
-          else
-            echo "Warning: could not find node binary for arch check"
-          fi
 
       - name: Upload build artifacts (debug)
         uses: actions/upload-artifact@v4
