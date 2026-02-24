@@ -74,6 +74,8 @@ jobs:
 
       - name: Install cross-compilation toolchain
         run: |
+          # Detect system GCC major version for matching 32-bit libstdc++ package
+          GCC_VER=$(gcc -dumpversion | cut -d. -f1)
           sudo dpkg --add-architecture i386
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -81,7 +83,7 @@ jobs:
             g++-arm-linux-gnueabihf \
             binutils-arm-linux-gnueabihf \
             libc6-dev-i386 \
-            lib32stdc++-12-dev \
+            "lib32stdc++-${GCC_VER}-dev" \
             python3 \
             python3-pip \
             ninja-build \
