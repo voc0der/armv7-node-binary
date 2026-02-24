@@ -64,9 +64,6 @@ jobs:
   build:
     name: Cross-Compile Node.js ${{ needs.check-version.outputs.node_version }} for ARMv7
     needs: check-version
-    # GCC 13 (ubuntu-24.04 default) has template errors in V8's Turboshaft
-    # when compiling with -m32. GCC 12 is installed for host -m32 compilation.
-    # GCC 13 cross-compiler is fine for the ARM target code.
     runs-on: ubuntu-24.04
     if: needs.check-version.outputs.already_exists == 'false' || github.event.inputs.force_rebuild == 'true'
     timeout-minutes: 300
@@ -77,33 +74,17 @@ jobs:
 
       - name: Install cross-compilation toolchain
         run: |
-          sudo dpkg --add-architecture i386
           sudo apt-get update -qq
-
-          # ARM cross-compiler (uses system GCC 13 — fine for target code)
-          # GCC 12 for host -m32 compilation (GCC 13 has V8 Turboshaft
-          # template errors in 32-bit mode; GCC 11 is too old for Node 24)
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf \
             g++-arm-linux-gnueabihf \
             binutils-arm-linux-gnueabihf \
-            gcc-12 \
-            g++-12 \
-            libc6-dev-i386 \
-            lib32stdc++-12-dev \
             python3 \
             python3-pip \
             ninja-build \
             pkg-config \
             curl \
             xz-utils
-
-          # Symlink asm headers for -m32 compilation.
-          # linux-libc-dev only ships headers for native arch.
-          sudo mkdir -p /usr/include/i386-linux-gnu
-          sudo ln -sf /usr/include/x86_64-linux-gnu/asm /usr/include/i386-linux-gnu/asm
-
-          echo "Toolchain ready: GCC 12 for host (-m32), GCC $(arm-linux-gnueabihf-gcc -dumpversion) for ARM target."
 
       - name: Download Node.js source
         run: |
@@ -113,13 +94,35 @@ jobs:
           echo "NODE_SRC=node-v${VERSION}" >> $GITHUB_ENV
           echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
+      - name: Patch V8 for x86_64 host cross-compilation
+        working-directory: ${{ env.NODE_SRC }}
+        run: |
+          # V8 blocks x86_64 hosts from cross-compiling for ARM because
+          # mksnapshot needs to generate ARM machine code (requires ia32 host).
+          # Since we use --without-snapshot, mksnapshot isn't built and the
+          # host tools (torque, bytecode generator, js2c) only generate
+          # platform-independent C++ code and data tables.
+          #
+          # Patch 1: Remove the #error that blocks x86_64 host for ARM target
+          sed -i '/#error Target architecture arm is only supported on arm and ia32 host/d' \
+            deps/v8/include/v8config.h
+
+          # Patch 2: Remove static_assert that checks tagged pointer size
+          # matches between host and target. On x86_64 host kTaggedSize=8
+          # but ARM target expects 4. The host tools don't use tagged pointers
+          # at runtime — they just generate code.
+          sed -i '/static_assert((kTaggedSize == 8) == TAGGED_SIZE_8_BYTES)/d' \
+            deps/v8/src/common/globals.h
+
+          echo "V8 patched for x86_64 host cross-compilation"
+
       - name: Configure Node.js for ARMv7 cross-compilation
         working-directory: ${{ env.NODE_SRC }}
         run: |
-          # Host tools compiled as 32-bit (ia32) via -m32 so V8's tagged
-          # pointer size (4 bytes) matches the host pointer size.
-          # --without-snapshot skips mksnapshot (needs ARM code gen on host).
-          CC_host="gcc-12 -m32" CXX_host="g++-12 -m32" \
+          # Native 64-bit host compilers + ARM cross-compiler for target.
+          # --without-snapshot skips mksnapshot (the only tool that actually
+          # generates ARM machine code on the host).
+          CC_host=gcc CXX_host=g++ \
           AR_host=ar RANLIB_host=ranlib \
           CC=${{ env.CROSS_TRIPLE }}-gcc \
           CXX=${{ env.CROSS_TRIPLE }}-g++ \
