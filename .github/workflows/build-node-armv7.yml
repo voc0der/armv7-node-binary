@@ -2,8 +2,8 @@ name: Build Node.js ARMv7
 
 on:
   schedule:
-    # Run weekly on Mondays at 02:00 UTC
-    - cron: '0 2 * * 1'
+    # Run weekly on Tuesdays at 00:00 UTC (~4.5h before YoutubeDL-Material build)
+    - cron: '0 0 * * 2'
   workflow_dispatch:
     inputs:
       node_version:
